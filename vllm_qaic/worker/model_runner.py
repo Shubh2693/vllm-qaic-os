@@ -15,7 +15,6 @@ from contextlib import AbstractContextManager, contextmanager, nullcontext
 from copy import copy, deepcopy
 from dataclasses import dataclass
 from queue import Queue
-from threading import Event
 from typing import TYPE_CHECKING, NamedTuple
 
 import numpy as np
@@ -28,8 +27,9 @@ from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_group
 from vllm.distributed.kv_transfer.kv_connector.base import KVConnectorBase
 from vllm.forward_context import get_forward_context, set_forward_context
-from vllm.logger import init_logger
+from vllm_qaic.logger import init_logger
 from vllm.lora.request import LoRARequest
+from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.tasks import GenerationTask, SupportedTask
 from vllm.utils.import_utils import PlaceholderModule
@@ -129,7 +129,14 @@ class QaicAsyncPoolingModelRunnerOutput(AsyncModelRunnerOutput):
         self._num_scheduled_tokens_np = num_scheduled_tokens_np
         self._kv_connector_output = kv_connector_output
 
+        # Cached result, since get_output() may run early from
+        # synchronize_input_prep(), then again (as a no-op) from the engine.
+        self._output: ModelRunnerOutput | None = None
+
     def get_output(self) -> ModelRunnerOutput:
+        if self._output is not None:
+            return self._output
+
         self._model_runner.complete_all_inf(self._pending_prefill_exec_queue, 0)
 
         hidden_states = self._model_runner.model._process_encode_output(
@@ -145,8 +152,9 @@ class QaicAsyncPoolingModelRunnerOutput(AsyncModelRunnerOutput):
             self._kv_connector_output,
         )
 
-        self._model_runner.model_runner_output_event.set()
-
+        # Clears the pending marker so the next batch can proceed.
+        self._model_runner._pending_output = None
+        self._output = result
         return result
 
 
@@ -176,7 +184,14 @@ class QaicAsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
         self._input_batch_req_ids = input_batch_req_ids
         self._input_batch_req_id_to_index = input_batch_req_id_to_index
 
+        # Cached result, since get_output() may run early from
+        # synchronize_input_prep(), then again (as a no-op) from the engine.
+        self._output: ModelRunnerOutput | None = None
+
     def get_output(self) -> ModelRunnerOutput:
+        if self._output is not None:
+            return self._output
+
         state = self._state
         mr = self._model_runner
 
@@ -210,7 +225,7 @@ class QaicAsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
                     kv_cache_info=mr.kv_cache_info,  # type: ignore[has-type]
                     connector_metadata=self._kv_connector_metadata,
                 )
-            return ModelRunnerOutput(
+            self._output = ModelRunnerOutput(
                 req_ids=self._input_batch_req_ids,
                 req_id_to_index=self._input_batch_req_id_to_index,
                 sampled_token_ids=valid_sampled_token_ids,
@@ -220,6 +235,7 @@ class QaicAsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
                 kv_connector_output=kv_connector_output,
                 num_nans_in_logits=None,
             )
+            return self._output
 
         # 1. Wait for inference completiong
         mr.complete_all_inf(
@@ -256,12 +272,11 @@ class QaicAsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
             logits,
             hidden_states,
             state.scheduler_output.total_num_scheduled_tokens,
-            state.spec_decode_metadata,
         )
 
-        # 4. Set event to unblock future batches
+        # 4. Clear ephemeral state to unblock future batches
         mr.execute_model_state = None
-        mr.model_runner_output_event.set()
+        mr._pending_output = None
 
         output = ModelRunnerOutput(
             req_ids=req_ids_output_copy,
@@ -297,6 +312,7 @@ class QaicAsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
         output.sampled_token_ids = valid_sampled_token_ids
         output.logprobs = logprobs_lists
 
+        self._output = output
         return output
 
 
@@ -439,33 +455,42 @@ class QaicModelRunnerAoT(GPUModelRunner):
         ):
             # The parent's __init__ creates a GPU DraftModelProposer; override with
             # the QAIC-specific proposer. Model weights are loaded in load_model().
-            from vllm.v1.spec_decode.draft_model import (  # noqa: PLC0415
-                create_vllm_config_for_draft_model,
-            )
+            from vllm.config.utils import replace as config_replace  # noqa: PLC0415
 
             from vllm_qaic.spec_decode.qaic_draft_model import (  # noqa: PLC0415
                 QaicDraftModelProposer,
             )
 
-            draft_vllm_config = create_vllm_config_for_draft_model(self.vllm_config)
+            # Build a VllmConfig for the draft model using the target's config
+            # as a base, overriding with draft-specific model/parallel config.
+            spec_cfg = self.speculative_config
+            draft_vllm_config = config_replace(
+                self.vllm_config,
+                model_config=spec_cfg.draft_model_config,
+                quant_config=None,
+            )
             _draft_override = (self.vllm_config.additional_config or {}).get(
                 "draft_override_qaic_config"
             )
             if _draft_override is not None:
                 # Give the draft model its own additional_config dict; cannot mutate
-                # the shared parent dict (create_vllm_config_for_draft_model does not
-                # deep-copy additional_config).
-                draft_vllm_config = draft_vllm_config.replace(
+                # the shared parent dict.
+                draft_vllm_config = config_replace(
+                    draft_vllm_config,
                     additional_config={
-                        **draft_vllm_config.additional_config,
+                        **(draft_vllm_config.additional_config or {}),
                         "override_qaic_config": _draft_override,
-                    }
+                    },
                 )
             self.drafter = QaicDraftModelProposer(draft_vllm_config)
         # Extract configuration params
         self.num_kv_heads = self.model_config.get_num_kv_heads(self.parallel_config)
         self.head_size = self.model_config.get_head_size()
         self.execute_model_state: QaicExecuteModelState | None = None
+        # Undrained AsyncModelRunnerOutput from sample_tokens(). Drained early
+        # by the next execute_model()'s synchronize_input_prep() if it needs
+        # this batch's exec object back before the engine calls get_output().
+        self._pending_output: AsyncModelRunnerOutput | None = None
         self.kv_caches: list[list] = [
             [] for _ in range(vllm_config.scheduler_config.max_num_seqs)
         ]
@@ -497,7 +522,6 @@ class QaicModelRunnerAoT(GPUModelRunner):
         # max_decode_tokens > 1 (i.e. when SpD is active). Reads before the
         # first _prepare_qaic_inputs call return 0.
         self.spec_decode_max_seq_len = 0
-        self.model_runner_output_event: Event = Event()
         # Post-process tensors
         self._postprocess_tensors()
 
@@ -538,7 +562,7 @@ class QaicModelRunnerAoT(GPUModelRunner):
         self.input_batch.block_table[0].block_table.np = self.input_batch.block_table[
             0
         ].block_table.cpu.numpy()
-        self.positions_np = self.positions.np
+        self.positions_np = self.positions.numpy()
         if self.uses_mrope:
             self.mrope_positions_np = self.mrope_positions.np
 
@@ -674,10 +698,7 @@ class QaicModelRunnerAoT(GPUModelRunner):
         num_scheduled_tokens_np: np.ndarray,
         kv_connector_output: KVConnectorOutput | None,
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput:
-        if not self.model.is_qaic_pooler and self.model.task not in (
-            "score",
-            "classify",
-        ):  # for CPU based embed pooling, use GPU model runner's _pool
+        if not self.model.is_qaic_pooler and self.model.task != "classify":  # for CPU based embed pooling, use GPU model runner's _pool
             # Force synchronous path: AsyncGPUPoolingModelRunnerOutput requires
             # CUDA streams which are not available on QAIC hardware.  The QAIC
             # async scheduling for pooling is handled at a higher level by
@@ -696,14 +717,14 @@ class QaicModelRunnerAoT(GPUModelRunner):
                 self.use_async_scheduling = orig_async
             return result
 
-        # For QAIC based pooler OR score/classify tasks (CPU or QAIC),
+        # For QAIC based pooler OR classify task (CPU or QAIC),
         # model outputs are already pooled — wrap directly in ModelRunnerOutput.
         num_reqs_qaicpooler = self.input_batch.num_reqs
         assert num_reqs_qaicpooler == len(self.input_batch.pooling_params), (
             "Either all or none of the requests in a batch must be pooling request"
         )
         hidden_states_qaicpooler = hidden_states[:num_reqs_qaicpooler]
-        seq_lens_qaicpooler = self.seq_lens.cpu[:num_reqs_qaicpooler]
+        seq_lens_qaicpooler = self.optimistic_seq_lens_cpu[:num_reqs_qaicpooler]
 
         pooling_metadata_qaicpooler = self.input_batch.get_pooling_metadata()
         pooling_metadata_qaicpooler.build_pooling_cursor(
@@ -715,9 +736,7 @@ class QaicModelRunnerAoT(GPUModelRunner):
         finished_mask_qaicpooler = [
             seq_len == prompt_len
             for seq_len, prompt_len in zip(
-                seq_lens_qaicpooler,
-                pooling_metadata_qaicpooler.prompt_lens,
-                strict=False,
+                seq_lens_qaicpooler, pooling_metadata_qaicpooler.prompt_lens
             )
         ]
 
@@ -770,14 +789,16 @@ class QaicModelRunnerAoT(GPUModelRunner):
         # num_scheduled_tokens, [2, 5, 3]
         # E.g., [2, 5, 3] -> [0, 0, 1, 1, 1, 1, 1, 2, 2, 2]
         req_indices = np.repeat(self.arange_np[:num_reqs], num_scheduled_tokens)
-        cu_num_tokens, arange = self._get_cumsum_and_arange(num_scheduled_tokens)
-        self.cu_num_tokens = cu_num_tokens
-        positions_np = self.positions_np[:total_num_scheduled_tokens]
-        np.add(
-            self.input_batch.num_computed_tokens_cpu[req_indices],
-            arange,
-            out=positions_np,
+        cu_num_tokens = self._get_cumsum_and_arange(
+            num_scheduled_tokens, self.query_pos.np
         )
+        self.cu_num_tokens = cu_num_tokens
+        total_tokens = cu_num_tokens[-1]
+        self.positions_np[:total_tokens] = (
+            self.input_batch.num_computed_tokens_cpu[req_indices]
+            + self.query_pos.np[:total_tokens]
+        )
+        positions_np = self.positions_np[:total_tokens]
         if self.uses_mrope:
             self._calc_mrope_positions(scheduler_output)
 
@@ -794,9 +815,12 @@ class QaicModelRunnerAoT(GPUModelRunner):
             self.input_batch.block_table[0].get_numpy_array()[:num_reqs, 0] - 1
         )
 
-        self.seq_lens.np[:num_reqs] = (
-            self.input_batch.num_computed_tokens_cpu[:num_reqs] + num_scheduled_tokens
+        torch.add(
+            self.input_batch.num_computed_tokens_cpu_tensor[:num_reqs],
+            torch.from_numpy(num_scheduled_tokens),
+            out=self.optimistic_seq_lens_cpu[:num_reqs],
         )
+        self.optimistic_seq_lens_cpu[num_reqs:].fill_(0)
         # Compute max_seq_len if SpD
         if self.max_decode_tokens > 1:
             # value matches GPU SpecDecodeCommonAttnMetadata.max_seq_len
@@ -810,7 +834,7 @@ class QaicModelRunnerAoT(GPUModelRunner):
         num_tokens_np = np.array(num_tokens, dtype=np.int32)
 
         self.discard_request_mask.np[:num_reqs] = (
-            self.seq_lens.np[:num_reqs] < num_tokens_np
+            self.optimistic_seq_lens_cpu[:num_reqs].numpy() < num_tokens_np
         )
         if self.input_batch.prev_sampled_token_ids is not None:
             self._prepare_input_ids(
@@ -838,13 +862,18 @@ class QaicModelRunnerAoT(GPUModelRunner):
         cu_num_scheduled_tokens: np.ndarray,
     ) -> SpecDecodeMetadata:
         num_sampled_tokens = num_draft_tokens + 1
-        cu_num_sampled_tokens, arange = self._get_cumsum_and_arange(
-            num_sampled_tokens, cumsum_dtype=np.int32
+        # Use a temporary buffer for the batched arange output to avoid
+        # corrupting self.arange_np (which _get_cumsum_and_arange reads from).
+        arange_buf = np.empty_like(self.arange_np)
+        cu_num_sampled_tokens = self._get_cumsum_and_arange(
+            num_sampled_tokens, arange_buf, cumsum_dtype=np.int32
         )
         bonus_logits_indices = cu_num_sampled_tokens - 1
-        cu_num_draft_tokens, arange = self._get_cumsum_and_arange(
-            num_draft_tokens, cumsum_dtype=np.int32
+        cu_num_draft_tokens = self._get_cumsum_and_arange(
+            num_draft_tokens, arange_buf, cumsum_dtype=np.int32
         )
+        total_draft = int(cu_num_draft_tokens[-1]) if cu_num_draft_tokens.size else 0
+        arange = arange_buf[:total_draft]
         target_logits_indices = np.repeat(
             cu_num_sampled_tokens - num_sampled_tokens, num_draft_tokens
         )
@@ -892,15 +921,10 @@ class QaicModelRunnerAoT(GPUModelRunner):
 
     @contextmanager
     def synchronize_input_prep(self):
-        if self.use_async_scheduling:
-            # If there are any previous processed batch or pending model state
-            if self.input_batch.req_ids or self.execute_model_state is not None:
-                # Only block when we actually expect a previous step
-                self.model_runner_output_event.wait(
-                    timeout=self.model.async_scheduling_exec_timeout  # type: ignore
-                )
-            # Reset the event before the new step begins so the next caller will block
-            self.model_runner_output_event.clear()
+        if self.use_async_scheduling and self._pending_output is not None:
+            # Drain the previous batch now, in case this batch needs its
+            # exec object back before the engine calls get_output() on it.
+            self._pending_output.get_output()
 
         yield
 
@@ -1271,13 +1295,15 @@ class QaicModelRunnerAoT(GPUModelRunner):
                     kv_connector_output,
                 )
             else:
-                return QaicAsyncPoolingModelRunnerOutput(
+                async_output = QaicAsyncPoolingModelRunnerOutput(
                     model_runner=self,
                     pending_prefill_exec_queue=pending_prefill_exec_queue,
                     num_scheduled_tokens=num_scheduled_tokens,
                     num_scheduled_tokens_np=num_scheduled_tokens_np,
                     kv_connector_output=kv_connector_output,
                 )
+                self._pending_output = async_output
+                return async_output
 
         self.execute_model_state = QaicExecuteModelState(
             scheduler_output,
@@ -1307,8 +1333,6 @@ class QaicModelRunnerAoT(GPUModelRunner):
         self.kv_connector_output = None
 
         if self.execute_model_state is None:
-            if self.use_async_scheduling:
-                self.model_runner_output_event.set()
             # Nothing to do (PP non-final rank case), output isn't used.
             if not kv_connector_output:
                 return None  # type: ignore[return-value]
@@ -1341,9 +1365,8 @@ class QaicModelRunnerAoT(GPUModelRunner):
                 # Disagg prefill: unblock the next batch early since sampled
                 # tokens are not needed.
                 self.execute_model_state = None
-                self.model_runner_output_event.set()
 
-            return QaicAsyncGPUModelRunnerOutput(
+            async_output = QaicAsyncGPUModelRunnerOutput(
                 model_runner=self,
                 state=state,
                 grammar_output=grammar_output,
@@ -1352,6 +1375,9 @@ class QaicModelRunnerAoT(GPUModelRunner):
                 input_batch_req_ids=_input_batch_req_ids,
                 input_batch_req_id_to_index=_input_batch_req_id_to_index,
             )
+            if not self.is_async_kv_producer:
+                self._pending_output = async_output
+            return async_output
 
         # Unpack ephemeral state.
         (
@@ -1432,7 +1458,6 @@ class QaicModelRunnerAoT(GPUModelRunner):
             logits,
             hidden_states,
             scheduler_output.total_num_scheduled_tokens,
-            spec_decode_metadata,
         )
 
         if propose_drafts_after_bookkeeping:

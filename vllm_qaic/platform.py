@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: BSD-3-Clause-Clear
 # ------------------------------------------------------------------
 
-from vllm.logger import init_logger
+from vllm_qaic.logger import init_logger
 from .platform_base import QaicPlatform as QaicPlatformBase
 
 from .utils import (
@@ -15,6 +15,10 @@ logger = init_logger(__name__)
 
 
 class QaicPlatform(QaicPlatformBase):
+    @classmethod
+    def get_punica_wrapper(cls) -> str:
+        return "vllm.lora.punica_wrapper.punica_cpu.PunicaWrapperCPU"
+
     @classmethod
     def pre_register_and_update(cls, parser=None) -> None:
         cls.device_type = "qaic"

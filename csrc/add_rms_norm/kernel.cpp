@@ -285,9 +285,9 @@ QAIC_KERNEL_API uint32_t rms_norm_multi_nsp(const AicJitEntryPointConfig *cfg,
   }
 
   for (int iter = 0; iter < rowIters; ++iter) {
-    const int r      = iter * (int)numCores + (int)coreID;
+    const int r = iter * (int)numCores + (int)coreID;
     const int r_next = (iter + 1) * (int)numCores + (int)coreID;
-    const bool validRow     = (r      < total_rows);
+    const bool validRow = (r < total_rows);
     const bool validNextRow = (r_next < total_rows);
     // Ping-pong between slot 0 and 1 each iteration
     const int cur_slot = iter & 1;

@@ -25,7 +25,7 @@ from transformers.utils.import_utils import (
     is_torchvision_v2_available,
 )
 
-from vllm.logger import init_logger
+from vllm_qaic.logger import init_logger
 from vllm.model_executor.models.gemma3_mm import (
     Gemma3DummyInputsBuilder,
     Gemma3ForConditionalGeneration,
@@ -70,10 +70,10 @@ from vllm.model_executor.models.qwen3_vl_moe import (
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import (
     ImageItem,
-    ModalityData,
     MultiModalFieldConfig,
     MultiModalKwargsItems,
 )
+from vllm.inputs import ModalityData
 from vllm.multimodal.parse import (
     DictEmbeddingItems,
     ImageEmbeddingItems,
@@ -93,7 +93,13 @@ logger = init_logger(__name__)
 # transformers v5.5.4 replaced image_processor.min_pixels / .max_pixels class
 # attributes with a size dict keyed by 'shortest_edge' / 'longest_edge'.
 _TRANSFORMERS_NEW_IMAGE_PROCESSOR = _Version(_transformers_version) == _Version("5.5.4")
-
+_gemma4_get_placeholder_str = Gemma4ForConditionalGeneration.get_placeholder_str
+# Gemma4 with vllm v0.23 wabts image modality instead of image_embeds
+Gemma4ForConditionalGeneration.get_placeholder_str = classmethod(
+    lambda cls, modality, i: _gemma4_get_placeholder_str(
+        "image" if modality == "image_embeds" else modality, i
+    )
+)
 
 class QaicGemma3MultiModalProcessor(Gemma3MultiModalProcessor):
     def _call_hf_processor(
@@ -271,6 +277,15 @@ class QaicQwen2VLMultiModalDataParser(Qwen2VLMultiModalDataParser):
 
                 if num_frames == 0:
                     return super()._parse_image_data(data)
+
+                # Single-image encode output keeps the encoder batch dim
+                # ([1, V, hidden]); multi-image arrives flattened ([sum(V),
+                # hidden]). Flatten to 2-D so all items share the same rank,
+                # else MultiModalFlatField._reduce_data crashes when batching
+                # a 3-D item with 2-D items.
+                if image_embeds.ndim == 3:
+                    image_embeds = image_embeds.reshape(-1, image_embeds.shape[-1])
+                    data["image_embeds"] = image_embeds
 
                 # Determine vision size
                 # based on whether embeds are batched per frame or flattened.
@@ -542,11 +557,53 @@ class QaicQwen2_5_VLProcessingInfo(
                 self._hf_processor.image_processor = image_processor
         return self._hf_processor
 
-
-class QaicQwen2_5_VLMultiModalProcessor(Qwen2_5_VLMultiModalProcessor):
-    def _get_data_parser(self) -> MultiModalDataParser:
+    def get_data_parser(self) -> MultiModalDataParser:
         return QaicQwen2VLMultiModalDataParser(
-            self.info.get_hf_config().vision_config.spatial_merge_size,
+            self.get_hf_config().vision_config.spatial_merge_size,
+            image_grid_thw_lookup=self.image_grid_thw_lookup,
+        )
+
+
+class _QaicQwenVLMergedEmbedsFieldsMixin:
+    """Convert `image_grid_thw` from 3-D to 2-D for Qwen-VL models.
+    
+    In `qaic_disagg`, `_merge_embeds` adds a leading batch dim to
+    `image_grid_thw` ([N, 3] -> [1, N, 3]) and calls `_get_mm_fields_config`
+    directly, so `prod(-1)` is 2-D and `flat_from_sizes` raises "size_per_item
+    should be a 1-D tensor".
+
+    This mixin wraps `_get_mm_fields_config` to squeeze `ndim==3`
+    `image_grid_thw` back to `ndim==2`. No-op for normal pixel-value
+    requests, whose grids are already 2-D.
+    """
+
+    def _get_mm_fields_config(
+        self,
+        hf_inputs: BatchFeature,
+        hf_processor_mm_kwargs: Mapping[str, object],
+    ) -> Mapping[str, MultiModalFieldConfig]:
+        squeezed = None
+        for key in ("image_grid_thw", "video_grid_thw"):
+            grid = hf_inputs.get(key) if hasattr(hf_inputs, "get") else None
+            if (
+                _TRANSFORMERS_NEW_IMAGE_PROCESSOR
+                and grid is not None
+                and getattr(grid, "ndim", None) == 3
+            ):
+                if squeezed is None:
+                    squeezed = dict(hf_inputs)
+                squeezed[key] = grid.squeeze(0)
+        if squeezed is not None:
+            hf_inputs = BatchFeature(squeezed)
+        return super()._get_mm_fields_config(hf_inputs, hf_processor_mm_kwargs)
+
+
+class QaicQwen2_5_VLMultiModalProcessor(
+    _QaicQwenVLMergedEmbedsFieldsMixin, Qwen2_5_VLMultiModalProcessor
+):
+    def get_data_parser(self) -> MultiModalDataParser:
+        return QaicQwen2VLMultiModalDataParser(
+            self.get_hf_config().vision_config.spatial_merge_size,
             image_grid_thw_lookup=self.info.image_grid_thw_lookup,
         )
 
@@ -583,11 +640,19 @@ class QaicQwen3VLProcessingInfo(
                 self._hf_processor.image_processor = image_processor
         return self._hf_processor
 
-
-class QaicQwen3VLMultiModalProcessor(Qwen3VLMultiModalProcessor):
-    def _get_data_parser(self) -> MultiModalDataParser:
+    def get_data_parser(self) -> MultiModalDataParser:
         return QaicQwen2VLMultiModalDataParser(
-            self.info.get_hf_config().vision_config.spatial_merge_size,
+            self.get_hf_config().vision_config.spatial_merge_size,
+            image_grid_thw_lookup=self.image_grid_thw_lookup,
+        )
+
+
+class QaicQwen3VLMultiModalProcessor(
+    _QaicQwenVLMergedEmbedsFieldsMixin, Qwen3VLMultiModalProcessor
+):
+    def get_data_parser(self) -> MultiModalDataParser:
+        return QaicQwen2VLMultiModalDataParser(
+            self.get_hf_config().vision_config.spatial_merge_size,
             video_needs_metadata=True,
             image_grid_thw_lookup=self.info.image_grid_thw_lookup,
         )

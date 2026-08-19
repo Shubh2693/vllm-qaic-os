@@ -161,8 +161,7 @@ extern "C" void _single_nsp_rms_norm_bf16(
 // Pointers layout: [0]=attn_out, [1]=x, [2]=weight, [3]=residual_out, [4]=dst
 //   [5]=epsilon (float scalar), [6]=B (int scalar), [7]=M (int scalar), [8]=N (int scalar)
 // Each core owns a stripe of rows across all B*M rows.
-// Double-buffered DMA (slots 0/1) overlaps prefetch of row r+1 with
-// compute on row r.
+// Double-buffered DMA (slots 0/1) overlaps prefetch of row r+1 with compute on row r.
 QAIC_KERNEL_API uint32_t rms_norm_multi_nsp_bf16(
     const AicJitEntryPointConfig *cfg, const AicJitPointerArray *ptrs) {
   const uint16_t *attn_out_ddr = (const uint16_t *)ptrs->pointers[0];
@@ -289,9 +288,9 @@ QAIC_KERNEL_API uint32_t rms_norm_multi_nsp_bf16(
   }
 
   for (int iter = 0; iter < rowIters; ++iter) {
-    const int r      = iter * (int)numCores + (int)coreID;
+    const int r = iter * (int)numCores + (int)coreID;
     const int r_next = (iter + 1) * (int)numCores + (int)coreID;
-    const bool validRow     = (r      < total_rows);
+    const bool validRow = (r < total_rows);
     const bool validNextRow = (r_next < total_rows);
     // Ping-pong between slot 0 and 1 each iteration
     const int cur_slot = iter & 1;

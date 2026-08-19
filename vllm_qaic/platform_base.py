@@ -4,16 +4,16 @@
 # ------------------------------------------------------------------
 
 import ast
+import functools
 import importlib
 import importlib.util
 import json
 import os
 from typing import TYPE_CHECKING
-import functools
 
 import torch
 
-from vllm.logger import init_logger
+from vllm_qaic.logger import init_logger
 from vllm.platforms import Platform, PlatformEnum
 from vllm.utils.import_utils import PlaceholderModule
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
@@ -163,6 +163,10 @@ class QaicPlatform(Platform):
     @classmethod
     def get_worker_cls(cls):
         return cls.worker_cls
+
+    @classmethod
+    def manual_seed_all(cls, seed: int) -> None:
+        pass
 
     @classmethod
     def check_and_update_config(cls, vllm_config: VllmConfig) -> None:
@@ -331,9 +335,9 @@ class QaicPlatform(Platform):
                     # TODO: long_prefill_token_threshold should not be set when
                     # chunked prefill is disabled
                     logger.warning_once(
-                        "Chunked prefill is disabled; chunk size=%d will be used"
+                        "Chunked prefill is disabled; chunk size=%s will be used"
                         " as prefill_seq_len.",
-                        __prefill_seq_len,
+                        str(__prefill_seq_len),
                     )
                 if "override_qaic_config" not in additional_config:
                     additional_config["override_qaic_config"] = {}
@@ -347,13 +351,22 @@ class QaicPlatform(Platform):
                 # gives the scheduler the correct per-step budget AND sizes the buffers
                 # large enough to never overflow after decode expansion.
                 scheduler_config.max_num_batched_tokens = min(
-                    scheduler_config.max_num_seqs * __prefill_seq_len,
+                    scheduler_config.max_num_seqs * (max(__prefill_seq_len) if isinstance(__prefill_seq_len, (list, tuple)) else __prefill_seq_len),
                     scheduler_config.max_num_batched_tokens,
                 )
+            # Reset max_num_scheduled_tokens so that
+            # _set_max_num_scheduled_tokens() recalculates it from the
+            # (now-overridden) max_num_batched_tokens when __post_init__
+            # re-runs in the EngineCore subprocess (core.py:1038).
+            scheduler_config.max_num_scheduled_tokens = None
 
         if cls.is_aot:
-            # Intel OpenMP tuning — only activate when user has already preloaded
-            # libiomp5.so (Intel OpenMP runtime).
+            # libiomp5.so (Intel's OpenMP runtime) OMP barrier/blocktime tuning —
+            # only activate when the user has already preloaded it via LD_PRELOAD.
+            # Despite the library's name, this tuning benefits both Intel and AMD
+            # CPUs (KMP_TPAUSE is a documented no-op on non-Intel silicon; the other
+            # KMP_* vars measurably speed up CPU-bound speculative-decoding proposers
+            # on AMD EPYC as well).
             # Set VLLM_DISABLE_LD_PRELOAD_OPT=1 to skip this optimization.
             ld_preload_str = os.getenv("LD_PRELOAD", "")
             disable_opt = os.getenv("VLLM_DISABLE_LD_PRELOAD_OPT", "0") == "1"
@@ -430,7 +443,7 @@ class QaicPlatform(Platform):
                 # Monkey patch uniproc_executor to QaicUniProcExecutor
                 import vllm.v1.executor.uniproc_executor as uniproc_executor
 
-                from vllm_qaic.qaic_uniproc_executor import QaicUniProcExecutor
+                from vllm_qaic.executor.qaic_uniproc_executor import QaicUniProcExecutor
 
                 uniproc_executor.UniProcExecutor = QaicUniProcExecutor
                 stages = int(override_qaic_config.get("stages"))
@@ -475,6 +488,7 @@ class QaicPlatform(Platform):
         cls,
         selected_backend: AttentionBackendEnum,
         attn_selector_config,
+        num_heads: int | None = None,
     ) -> str:
         # for eager mode
         if attn_selector_config.use_mla:
@@ -559,13 +573,29 @@ class QaicPlatform(Platform):
 
         Currently only Qwen2.5VL and Qwen3VL are supported.
         """
-        # For Qwen2.5VL/Qwen3VL on QAIC, min_pixels and max_pixels must match QEfficient
-        # values and cannot be overridden per request.
+        # For Qwen2.5VL/Qwen3VL on QAIC, min_pixels and max_pixels must match
+        # QEfficient values.
+        vision_config = getattr(model_config.hf_config, "vision_config", None)
+        patch_size = getattr(
+            vision_config,
+            "patch_size",
+            getattr(vision_config, "spatial_patch_size", 14),
+        )
+        merge_size = getattr(vision_config, "spatial_merge_size", 2)
+        factor = patch_size * merge_size
+        default_min_pixels = 4 * factor * factor
+        default_max_pixels = 16384 * factor * factor
+
         if model_config.mm_processor_kwargs is None:
             model_config.mm_processor_kwargs = {}
         mm_kwargs = model_config.mm_processor_kwargs
-        mm_kwargs.setdefault("max_pixels", 1280 * 28 * 28)
-        mm_kwargs.setdefault("min_pixels", 4 * 28 * 28)
+        override_mm_kwargs = override_qaic_config.get("mm_processor_kwargs") or {}
+        mm_kwargs["max_pixels"] = override_mm_kwargs.get(
+            "max_pixels", mm_kwargs.get("max_pixels", default_max_pixels)
+        )
+        mm_kwargs["min_pixels"] = override_mm_kwargs.get(
+            "min_pixels", mm_kwargs.get("min_pixels", default_min_pixels)
+        )
         override_qaic_config["mm_processor_kwargs"] = {
             k: mm_kwargs[k] for k in ("max_pixels", "min_pixels")
         }

@@ -6,8 +6,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Adapted from vllm/vllm/config/cache.py
 
-
-from typing import Literal
+from typing import Literal, get_args
 
 import torch
 import vllm.config
@@ -17,11 +16,14 @@ from pydantic.dataclasses import dataclass
 from vllm.config.cache import CacheConfig, CacheDType
 from vllm.config.device import DeviceConfig
 from vllm.config.utils import config
-from vllm.logger import init_logger
+from vllm_qaic.logger import init_logger
 
 logger = init_logger(__name__)
 
-QaicCacheDType = CacheDType | Literal["mxint8"]
+_QAIC_CACHE_DTYPES = ("mxint8",)
+QaicCacheDType = Literal[  # type: ignore[valid-type]
+    tuple(dict.fromkeys((*get_args(CacheDType), *_QAIC_CACHE_DTYPES)))
+]
 
 
 @config
