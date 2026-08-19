@@ -16,18 +16,25 @@
 # Usage:
 #   ./scripts/build_wheels.sh [aot|pyt|both] [--pyver 3.10|3.11|3.12]
 #                              [--outdir <dir>] [--device-arch v68|v81]
-#                              [--base-image <image:tag>] [--dry-run]
+#                              [--base-image <image:tag>] [--nofile <n>]
+#                              [--qaic-version <ver>] [--dry-run]
 
 set -euo pipefail
 
 DEFAULT_PYTHON_VERSION="3.12"
 DEFAULT_DEVICE_ARCH="v68"
+# `uv python install` bytecode-compiles the stdlib with one worker per CPU. On
+# many-core hosts that blows through Docker's default 1024-fd soft limit and
+# fails with "No file descriptors available (os error 24)". Containers do not
+# inherit the daemon's higher limit, so raise it per build.
+DEFAULT_NOFILE="65536"
 
 usage() {
   cat << EOM
 Usage: build_wheels.sh [aot|pyt|both] [--pyver 3.10|3.11|3.12]
                         [--outdir <dir>] [--device-arch v68|v81]
-                        [--base-image <image:tag>] [--dry-run]
+                        [--base-image <image:tag>] [--nofile <n>]
+                        [--qaic-version <ver>] [--dry-run]
 
 aot|pyt|both   Wheel(s) to build (default: both).
 --pyver        Python version to build with: 3.10, 3.11, or 3.12
@@ -40,6 +47,17 @@ aot|pyt|both   Wheel(s) to build (default: both).
 --base-image   Override the QAIC SDK base image (passed through as the
                BASE_IMAGE build-arg; default: each Dockerfile's own ARG
                default).
+--nofile       Open-file (nofile) ulimit for the build containers
+               (default: ${DEFAULT_NOFILE}). Containers do not inherit the
+               daemon's limit and default to 1024, which is too low for
+               'uv python install' on many-core hosts. Set to 0 to omit the
+               --ulimit flag and use the daemon default.
+--qaic-version QAIC SDK version recorded in the wheel's local version label
+               (passed through as the VLLM_QAIC_VERSION build-arg; default:
+               each Dockerfile's own ARG default). Produces a version of
+               <vllm>+pyt<ver> or <vllm>+aot<ver> — e.g. 1.23.0 yields
+               0.23.0+pyt1.23.0. This is metadata only: it does NOT change
+               which SDK is used (that comes from --base-image).
 --dry-run      Print the docker buildx commands without running them.
 EOM
 }
@@ -54,6 +72,8 @@ PYTHON_VERSION="${DEFAULT_PYTHON_VERSION}"
 OUT_DIR="${REPO_ROOT}/dist"
 DEVICE_ARCH="${DEFAULT_DEVICE_ARCH}"
 BASE_IMAGE=""
+NOFILE="${DEFAULT_NOFILE}"
+QAIC_VERSION=""
 DRY_RUN="OFF"
 
 if [[ $# -gt 0 && "$1" != --* ]]; then
@@ -67,6 +87,8 @@ while [[ $# -gt 0 ]]; do
         --outdir) OUT_DIR="$2"; shift 2 ;;
         --device-arch) DEVICE_ARCH="$2"; shift 2 ;;
         --base-image) BASE_IMAGE="$2"; shift 2 ;;
+        --nofile) NOFILE="$2"; shift 2 ;;
+        --qaic-version) QAIC_VERSION="$2"; shift 2 ;;
         --dry-run) DRY_RUN="ON"; shift ;;
         -h|--help) usage; exit 1 ;;
         *) echo "Unknown arg: $1" >&2; usage; exit 1 ;;
@@ -88,6 +110,20 @@ if [[ "${DEVICE_ARCH}" != "v68" && "${DEVICE_ARCH}" != "v81" ]]; then
     exit 1
 fi
 
+if [[ ! "${NOFILE}" =~ ^[0-9]+$ ]]; then
+    echo "ERROR: --nofile must be a non-negative integer" >&2
+    exit 1
+fi
+
+# The value lands in a PEP 440 local version label (the '+pyt<ver>' suffix),
+# which permits only alphanumerics separated by periods. Reject anything else
+# here rather than letting it fail deep inside the wheel build.
+if [ -n "${QAIC_VERSION}" ] && [[ ! "${QAIC_VERSION}" =~ ^[a-zA-Z0-9]+(\.[a-zA-Z0-9]+)*$ ]]; then
+    echo "ERROR: --qaic-version must be alphanumeric segments separated by periods" >&2
+    echo "       (e.g. 1.22, 1.23.0, 1.23.0.39); got '${QAIC_VERSION}'" >&2
+    exit 1
+fi
+
 PYVER_TAG="py${PYTHON_VERSION//./}"
 
 run_echo() {
@@ -105,6 +141,8 @@ echo "PYTHON_VERSION : ${PYTHON_VERSION}"
 echo "MODE           : ${BUILD_TARGET}"
 echo "DEVICE_ARCH    : ${DEVICE_ARCH} (pyt only)"
 echo "BASE_IMAGE     : ${BASE_IMAGE:-<Dockerfile default>}"
+echo "NOFILE         : ${NOFILE}$([ "${NOFILE}" == "0" ] && echo " (--ulimit omitted)")"
+echo "QAIC_VERSION   : ${QAIC_VERSION:-<Dockerfile default>}"
 echo "OUT_DIR        : ${OUT_DIR}"
 echo "================================================================"
 
@@ -113,12 +151,31 @@ if [ -n "${BASE_IMAGE}" ]; then
     BASE_IMAGE_ARGS=(--build-arg "BASE_IMAGE=${BASE_IMAGE}")
 fi
 
+# Only forward VLLM_QAIC_VERSION when set, so each Dockerfile's own ARG default
+# stays the single source of truth otherwise.
+QAIC_VERSION_ARGS=()
+if [ -n "${QAIC_VERSION}" ]; then
+    QAIC_VERSION_ARGS=(--build-arg "VLLM_QAIC_VERSION=${QAIC_VERSION}")
+fi
+
+# Raise the container's open-file limit unless explicitly disabled with
+# --nofile 0. Docker gives containers a 1024 soft limit regardless of the
+# daemon's own (much higher) limit, and `uv python install` runs one
+# bytecode-compile worker per CPU — enough to exhaust 1024 fds on a
+# many-core host and fail the build with os error 24 (EMFILE).
+ULIMIT_ARGS=()
+if [ "${NOFILE}" != "0" ]; then
+    ULIMIT_ARGS=(--ulimit "nofile=${NOFILE}:${NOFILE}")
+fi
+
 build_aot_wheel() {
     echo ""
     echo "=== Building AOT wheel (pure Python, py3-none-any — pyver-independent) ==="
     run_echo docker buildx build --target wheel -f "${DOCKER_DIR}/Dockerfile.aot" \
         --build-arg PYTHON_VERSION="${PYTHON_VERSION}" \
         "${BASE_IMAGE_ARGS[@]}" \
+        "${QAIC_VERSION_ARGS[@]}" \
+        "${ULIMIT_ARGS[@]}" \
         --output "type=local,dest=${OUT_DIR}/aot" \
         "${REPO_ROOT}"
 }
@@ -130,6 +187,8 @@ build_pyt_wheel() {
         --build-arg PYTHON_VERSION="${PYTHON_VERSION}" \
         --build-arg QAIC_DEVICE_ARCH="${DEVICE_ARCH}" \
         "${BASE_IMAGE_ARGS[@]}" \
+        "${QAIC_VERSION_ARGS[@]}" \
+        "${ULIMIT_ARGS[@]}" \
         --output "type=local,dest=${OUT_DIR}/pyt/${PYVER_TAG}" \
         "${REPO_ROOT}"
 }
@@ -151,7 +210,10 @@ report_wheel() {
     local label="$1"
     local pattern="$2"
     local whl
-    whl=$(ls ${pattern} 2>/dev/null | head -1)
+    # Report the newest match, not the alphabetically first: the output dir is
+    # not cleared between runs, so stale wheels from an earlier --qaic-version
+    # can otherwise be reported as this run's result.
+    whl=$(ls -t ${pattern} 2>/dev/null | head -1)
     if [ -n "${whl}" ]; then
         echo "  ${label}: FOUND (${whl})"
     else
